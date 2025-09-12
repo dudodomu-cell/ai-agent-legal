@@ -3,17 +3,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 from pypdf import PdfReader
+from fastapi import Query
 
 app = FastAPI()
 client = OpenAI()
 
-# CORS для фронтенду (поки дозволяємо все)
+from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
 @app.get("/")
 def root():
     return {"ok": True}
@@ -98,6 +100,14 @@ def chat(req: ChatRequest):
         return {"answer": f"{answer}\n\n{disclaimer}"}
     except Exception as e:
         return {"error": str(e)}
+
+        from fastapi import Query
+
+@app.get("/chat_get")
+def chat_get(q: str = Query(..., description="question")):
+    # Використовуємо ту ж функцію, що і для POST
+    return chat(ChatRequest(question=q))
+
 
 if __name__ == "__main__":
     import uvicorn
