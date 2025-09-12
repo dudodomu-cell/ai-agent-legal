@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+openai
+pypdf
+langchain
+langchain-community
+langchain-openai
+chromadb
