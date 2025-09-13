@@ -1,115 +1,167 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from openai import OpenAI
-from pypdf import PdfReader
-from fastapi import Query
+from fastapi.responses import PlainTextResponse, JSONResponse
+import os
 
 app = FastAPI()
-client = OpenAI()
 
-from fastapi.middleware.cors import CORSMiddleware
+# CORS: дозволяємо фронту на 5500 звертатися до бекенду на 8000
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:5500", "http://localhost:5500", "*"],  # dev-режим
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.get("/")
-def root():
-    return {"ok": True}
 
-# ---------- ✅ ПРОСТИЙ ІНДЕКС PDF (КАШ У ПАМ’ЯТІ) ----------
-PDF_PATH = "mica.pdf"  # якщо інша назва — підправ
-_PAGES: list[dict] = []
+def gpt_answer(question: str) -> str:
+    """
+    Повертає відповідь GPT або підміняє echo, якщо:
+    - немає OPENAI_API_KEY
+    - сталася помилка/таймаут
+    """
+    question = (question or "").strip()
+    if not question:
+        return "Порожнє питання."
 
-def _load_pdf_once():
-    global _PAGES
-    if _PAGES:
-        return
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        # Fallback без ключа
+        return f"Echo: {question}"
+
     try:
-        reader = PdfReader(PDF_PATH)
-        pages = []
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text() or ""
-            # трішки чистки: прибираємо зайві пропуски
-            text = " ".join(text.split())
-            pages.append({"page": i + 1, "text": text})
-        _PAGES = pages
-        print(f"PDF loaded: {len(_PAGES)} pages")
-    except Exception as e:
-        print("PDF LOAD ERROR:", e)
-        _PAGES = []
+        # Новий SDK OpenAI (v1)
+        from openai import OpenAI
+        # Можеш поміняти модель однією змінною
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        # Таймаут на весь запит, щоб не висіло
+        client = OpenAI(api_key=api_key, timeout=10.0)
 
-def _score_page(query: str, page_text: str) -> int:
-    # Дуже простий скоринг: рахуємо збіги слів (укр/рос/англ норм)
-    q_words = [w for w in query.lower().split() if len(w) > 2]
-    txt = page_text.lower()
-    return sum(txt.count(w) for w in q_words)
-
-def _find_snippets(query: str, k: int = 3, window: int = 400):
-    """Шукає слова запиту і вирізає уривки довкола збігів."""
-    _load_pdf_once()
-    if not _PAGES:
-        return []
-
-    q_words = [w for w in query.lower().split() if len(w) > 2]
-    hits = []
-
-    for p in _PAGES:
-        text = p["text"].lower()
-        for w in q_words:
-            idx = text.find(w)
-            if idx != -1:
-                start = max(0, idx - window // 2)
-                end = min(len(p["text"]), idx + window // 2)
-                snippet = p["text"][start:end]
-                hits.append({"page": p["page"], "text": snippet})
-
-    # залишаємо лише кілька найрелевантніших
-    return hits[:k]
-
-class ChatRequest(BaseModel):
-    question: str
-
-@app.post("/chat")
-def chat(req: ChatRequest):
-    try:
-        snippets = _find_snippets(req.question, k=3)
-        if not snippets:
-            system = ("Ти — юридичний асистент. Якщо в наданому контексті немає відповіді — чесно скажи, що не знайшов.")
-            user = f"Питання: {req.question}\n\nКонтекст: (немає релевантних уривків)"
-        else:
-            ctx = "\n\n".join([f"[page {s['page']}]\n{s['text']}" for s in snippets])
-            system = ("Ти — юридичний асистент. Відповідай ТІЛЬКИ на основі наведеного контексту з MiCA. "
-                      "Якщо відповіді немає у контексті — скажи, що не знайшов. "
-                      "Наприкінці наведи список сторінок у форматі [page N].")
-            user = f"Питання: {req.question}\n\nКонтекст із MiCA:\n{ctx}"
-
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.1,
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": question}],
+            temperature=0.2,
         )
-        answer = r.choices[0].message.content.strip()
-        disclaimer = "⚠️ Це не є юридичною консультацією. Для остаточного вирішення зверніться до кваліфікованого юриста."
-        return {"answer": f"{answer}\n\n{disclaimer}"}
+        if resp and resp.choices:
+            return resp.choices[0].message.content or "Відповідь порожня."
+        return "Відповідь порожня."
     except Exception as e:
-        return {"error": str(e)}
+        # Акуратний fallback, щоб UI не висів
+        return f"Echo (OpenAI error: {type(e).name}): {question}"
 
-        from fastapi import Query
+def gpt_answer(question: str) -> str:
+    # ... твій існуючий код вище ...
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return f"Echo: {question}"
+
+    # >>>> ДОДАНО: знайдемо релевантний контекст
+    ctx = rag_search(question, k=5)
+    system = "Ти юридичний помічник. Відповідай лише на основі поданого контексту."
+    if ctx:
+        prompt = rag_prompt(question, ctx)
+    else:
+        # Якщо індексу ще нема — відповімо як звичайний чат (тимчасово)
+        prompt = question
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, timeout=12.0)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+        # Якщо є контекст — кладемо його в один user-повідомлення (простий варіант)
+        messages = [{"role":"system","content":system},
+                    {"role":"user","content":prompt}]
+
+        resp = client.chat.completions.create(
+            model=model, messages=messages, temperature=0.0,
+        )
+        ans = resp.choices[0].message.content if resp and resp.choices else ""
+        return ans or "Відповідь порожня."
+    except Exception as e:
+        return f"Echo (OpenAI error: {type(e).name}): {question}"
+
+# ---- RAG: завантаження індексу ----
+from pathlib import Path
+import numpy as np, pickle, os
+from typing import List, Tuple
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+VEC_PATH = DATA_DIR / "vectors.npy"
+CH_PATH  = DATA_DIR / "chunks.pkl"
+
+VEC = None
+CHUNKS = None
+
+def _cosine_sim(a, b):
+    # a: (d,), b: (N,d)
+    na = a / (np.linalg.norm(a) + 1e-9)
+    nb = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-9)
+    return nb @ na
+
+def _embed_query(q: str) -> np.ndarray:
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    emb_model = os.getenv("EMB_MODEL", "text-embedding-3-small")
+    resp = client.embeddings.create(model=emb_model, input=[q])
+    return np.array(resp.data[0].embedding, dtype=np.float32)
+
+def rag_search(query: str, k: int = 5) -> List[Tuple[str,int,float]]:
+    """Повертає список (текст_шматка, сторінка, схожість)"""
+    if VEC is None or CHUNKS is None:
+        return []
+    qv = _embed_query(query)
+    sims = _cosine_sim(qv, VEC)  # (N,)
+    idx = np.argsort(-sims)[:k]
+    out = []
+    for i in idx:
+        c = CHUNKS[i]
+        out.append((c["text"], c["page"], float(sims[i])))
+    return out
+
+def rag_prompt(query: str, ctx_items: List[Tuple[str,int,float]]) -> str:
+    parts = []
+    for i,(t,p,s) in enumerate(ctx_items, start=1):
+        parts.append(f"[{i}] (MiCA p.{p}, score={s:.2f}) {t}")
+    ctx = "\n\n".join(parts) if parts else "NO_CONTEXT"
+    return f"""You are a legal assistant restricted to the provided context.
+Answer ONLY if the answer is supported by the context. If not found, say you cannot answer from the provided documents.
+Cite sources as: (MiCA p.<page>). Keep answers concise and in Ukrainian.
+
+User question: {query}
+
+Context:
+{ctx}
+"""
+
+# завантажити індекс при старті (якщо є)
+try:
+    if VEC_PATH.exists() and CH_PATH.exists():
+        VEC = np.load(VEC_PATH)
+        with open(CH_PATH, "rb") as f:
+            CHUNKS = pickle.load(f)
+        print(f"RAG index loaded: vecs={VEC.shape}, chunks={len(CHUNKS)}")
+    else:
+        print("RAG index not found. Run: python build_index.py")
+except Exception as e:
+    print("RAG load error:", e)        
+
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "ok"
+
+# ====== ОТУТ Є chat() ======
+@app.post("/chat")
+def chat(req: dict):
+    question = (req.get("question") or "").strip()
+    if not question:
+        return {"error": "empty question"}
+    # >>> Ось тут ідемо в GPT (з безпечним fallback усередині)
+    answer = gpt_answer(question)
+    return {"answer": answer}
 
 @app.get("/chat_get")
 def chat_get(q: str = Query(..., description="question")):
-    # Використовуємо ту ж функцію, що і для POST
-    return chat(ChatRequest(question=q))
-
-
-if __name__ == "__main__":
-    import uvicorn
-    # (на час розробки тримаємо лог у консолі)
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Використовуємо той самий код, що й /chat, але з GET
+    return chat({"question": q})
