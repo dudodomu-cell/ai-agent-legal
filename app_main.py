@@ -2,6 +2,45 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 import os
+from dotenv import load_dotenv
+
+# load .env once on startup
+
+load_dotenv()
+
+def env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1","true","yes","on")
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except:
+        return default
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except:
+        return default
+
+# читаємо змінні з .env
+APP_VERSION    = os.getenv("APP_VERSION", "0.1.1")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+REQUIRE_CONTEXT = env_bool("REQUIRE_CONTEXT", True)
+TOP_K           = env_int("TOP_K", 5)
+MIN_SIM         = env_float("MIN_SIM", 0.22)
+FAST_DEV        = env_bool("FAST_DEV", True) 
+FREE_LIMIT      = env_int("FREE_LIMIT", 5)          # поріг схожості, щоб вважати збіг реальним
+
+from datetime import datetime
+
+STATS = {
+    "total_requests": 0,
+    "start_time": datetime.utcnow().isoformat()
+}
 
 app = FastAPI()
 
@@ -50,32 +89,35 @@ def gpt_answer(question: str) -> str:
         return f"Echo (OpenAI error: {type(e).name}): {question}"
 
 def gpt_answer(question: str) -> str:
-    # ... твій існуючий код вище ...
+    question = (question or "").strip()
+    if not question:
+        return "Порожнє питання."
+
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return f"Echo: {question}"
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # >>>> ДОДАНО: знайдемо релевантний контекст
-    ctx = rag_search(question, k=5)
-    system = "Ти юридичний помічник. Відповідай лише на основі поданого контексту."
-    if ctx:
-        prompt = rag_prompt(question, ctx)
-    else:
-        # Якщо індексу ще нема — відповімо як звичайний чат (тимчасово)
-        prompt = question
+    # ---- RAG: шукаємо контекст ----
+    ctx_items = rag_search(question, k=TOP_K) if (VEC is not None and CHUNKS is not None) else []
+    # відфільтруємо за порогом схожості
+    ctx_items = [c for c in ctx_items if c[2] >= MIN_SIM]
+
+    # Якщо ТРЕБА контекст, але його немає — чесно відмовляємось
+    if REQUIRE_CONTEXT and not ctx_items:
+        return "Не можу відповісти на це на основі наданих документів (MiCA). Спробуйте уточнити питання."
+
+    # Формуємо підказку з контекстом (або без, якщо індексу ще немає)
+    system = "You are a legal assistant AI. Answer strictly based only on the provided legal documents (MiCA Regulation). If the information is not in the context, say that you cannot answer."
+    prompt = rag_prompt(question, ctx_items) if ctx_items else question
 
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key, timeout=12.0)
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-        # Якщо є контекст — кладемо його в один user-повідомлення (простий варіант)
-        messages = [{"role":"system","content":system},
-                    {"role":"user","content":prompt}]
-
-        resp = client.chat.completions.create(
-            model=model, messages=messages, temperature=0.0,
-        )
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": prompt}]
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=0.0)
         ans = resp.choices[0].message.content if resp and resp.choices else ""
         return ans or "Відповідь порожня."
     except Exception as e:
@@ -156,12 +198,102 @@ def root():
 def chat(req: dict):
     question = (req.get("question") or "").strip()
     if not question:
-        return {"error": "empty question"}
-    # >>> Ось тут ідемо в GPT (з безпечним fallback усередині)
+        return JSONResponse({"error": "empty question"}, status_code=400)
+
+    STATS["total_requests"] += 1
+    free_left = max(0, FREE_LIMIT - STATS["total_requests"])
+
+    # check free limit
+    if STATS["total_requests"] > FREE_LIMIT:
+        return {
+            "answer": "You have reached the free request limit. Please subscribe to continue.",
+            "sources": [],
+            "usage": {
+                "total_requests": STATS["total_requests"],
+                "free_left": 0,
+                "limit": FREE_LIMIT
+            }
+        }
+
+    # 🔹 шукаємо контекст
+    ctx_items = rag_search(question, k=TOP_K)
+    ctx_items = [c for c in ctx_items if c[2] >= MIN_SIM]
+
+    # 🔹 формуємо уривки для фронта
+    if ctx_items:
+        src = [
+            {
+                "page": p,
+                "score": round(s, 3),
+                "text": (t[:320] + ("…" if len(t) > 320 else ""))  # скорочений фрагмент
+            }
+            for (t, p, s) in ctx_items
+        ]
+    else:
+        src = []
+
+    # 🔹 GPT-відповідь
     answer = gpt_answer(question)
-    return {"answer": answer}
+
+    return {
+        "answer": answer,
+        "sources": src,
+        "usage": {
+            "total_requests": STATS["total_requests"],
+            "free_left": free_left,
+            "limit": FREE_LIMIT
+        }
+    }
+        
 
 @app.get("/chat_get")
 def chat_get(q: str = Query(..., description="question")):
     # Використовуємо той самий код, що й /chat, але з GET
     return chat({"question": q})
+
+from fastapi.responses import JSONResponse
+
+@app.get("/health")
+def health():
+    ok = True
+    info = {
+        "version": APP_VERSION,
+        "has_index": bool(VEC is not None and CHUNKS is not None),
+        "vec_shape": tuple(VEC.shape) if VEC is not None else None,
+        "chunks": len(CHUNKS) if CHUNKS is not None else 0,
+    }
+    return {"ok": ok, **info}
+
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
+
+from fastapi.responses import JSONResponse
+
+@app.get("/config")
+def config():
+    return {
+        "version": APP_VERSION,
+        "require_context": REQUIRE_CONTEXT,
+        "top_k": TOP_K,
+        "min_sim": MIN_SIM,
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "has_index": bool(VEC is not None and CHUNKS is not None),
+        # ВАЖЛИВО: ключ не показуємо!
+    }
+
+@app.get("/stats")
+def stats():
+    return STATS
+
+@app.get("/config")
+def config():
+    return {
+        "version": APP_VERSION,
+        "require_context": REQUIRE_CONTEXT,
+        "top_k": TOP_K,
+        "min_sim": MIN_SIM,
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "fast_dev": FAST_DEV,                # ⬅️ додай це
+        "has_index": bool(VEC is not None and CHUNKS is not None),
+    }

@@ -1,65 +1,147 @@
 <!doctype html>
-<html lang="uk">
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>DEV Test</title>
+  <meta charset="utf-8" />
+  <title>Legal AI (MiCA) – DEV</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: system-ui, sans-serif; margin: 32px; }
-    #q { width: 360px; padding: 6px; }
-    #b { padding: 6px 12px; margin-left: 6px; }
-    #out {
-      white-space: pre-wrap; background: #f3f4f6; padding: 10px;
-      border-radius: 8px; margin-top: 12px; min-height: 60px;
+    :root { --bg:#0b1220; --card:#0f172a; --text:#e5e7eb; --muted:#9ca3af; --accent:#60a5fa; }
+    html,body{height:100%}
+    body{
+      margin:0; padding:24px; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;
+      background:linear-gradient(180deg,#0b1220,#111827 60%,#0b1220);
+      color:var(--text);
     }
+    .wrap{max-width:840px;margin:0 auto}
+    .card{
+      background:var(--card); border:1px solid #1f2937; border-radius:14px; padding:16px 16px 20px;
+      box-shadow:0 8px 30px rgba(0,0,0,.25)
+    }
+    h1{font-size:20px;margin:0 0 12px}
+    .row{display:flex;gap:8px;align-items:center}
+    input#q{
+      flex:1; font-size:16px; padding:10px 12px; border-radius:10px; border:1px solid #374151; outline:none;
+      background:#0b1220; color:var(--text)
+    }
+    button#b{
+      padding:10px 14px; font-size:15px; border-radius:10px; border:1px solid #374151; background:#111827; color:var(--text);
+      cursor:pointer
+    }
+    button#b:hover{border-color:#4b5563}
+    pre#out{
+      margin:12px 0 8px; white-space:pre-wrap; background:#0b1220; color:var(--text);
+      border:1px solid #1f2937; border-radius:10px; padding:12px; min-height:72px
+    }
+    #quota{font-size:13px; color:#cbd5e1}
+    #src{font-size:13px; color:#cbd5e1; margin-top:6px}
+    .warn{color:#fca5a5}
+    .disc{margin-top:12px; font-size:12px; color:var(--muted)}
+    a{color:var(--accent); text-decoration:none}
+    a:hover{text-decoration:underline}
+    .hint{font-size:12px; color:#a3a3a3; margin-top:6px}
+
+    details { margin-top: 6px; border: 1px solid #1f2937; border-radius: 8px; background:#0b1220; }
+    details > summary { cursor: pointer; padding: 8px 10px; list-style: none; outline: none; }
+    details[open] { border-color: #334155; }
+    .snippet { padding: 0 10px 10px; color:#cbd5e1; font-size:13px; white-space: pre-wrap; }
+    .badge { display:inline-block; font-size:12px; color:#93c5fd; margin-left:8px; }
   </style>
 </head>
-
-<div style="margin-top:16px;font-size:12px;color:#6b7280;max-width:700px">
-  ⚖️ <b>Дисклеймер:</b> Цей чат-бот надає довідкову інформацію з витягів
-  офіційних документів (MiCA). Це <u>не</u> є індивідуальною юридичною порадою.
-  Перевіряйте посилання на джерела та консультуйтеся з юристом у разі сумнівів.
-</div>
-
 <body>
-  <h3>Тест локального AI-бота</h3>
-  <input id="q" placeholder="Ваше питання">
-  <button id="b">Запитати</button>
-  <pre id="out"></pre>
+  <div class="wrap">
+    <div class="card">
+      <h1>Legal AI (MiCA) • DEV</h1>
+      <div class="row">
+        <input id="q" type="text" placeholder="Your question about MiCA…" />
+        <button id="b" type="button">Ask</button>
+      </div>
+
+      <pre id="out" aria-live="polite"></pre>
+      <div id="quota"></div>
+      <div id="src"></div>
+      <div class="disc">
+        ⚖️ <b>Disclaimer:</b> The assistant answers strictly based on excerpts from the MiCA Regulation (if found). This is not legal advice. Always verify sources and consult a qualified lawyer when needed.
+      </div>
+      <div class="hint">
+        Tip: try “What is a crypto-asset according to MiCA?” or “What are asset-referenced tokens under MiCA?”
+      </div>
+    </div>
+  </div>
 
   <script>
   (function(){
     function el(id){ return document.getElementById(id); }
-    var btn = el('b'), inp = el('q'), out = el('out');
+    var btn = el('b'), inp = el('q'), out = el('out'), quotaBox = el('quota'), srcBox = el('src');
 
-    btn.onclick = function(){
-      var v = inp && inp.value ? String(inp.value).trim() : '';
-      if(!v){ out.textContent = 'Введіть питання.'; return; }
-      out.textContent = '⏳ Запит...';
+    function setQuota(j){
+      if (!j || !j.usage) { quotaBox.textContent = ""; return; }
+      var left = j.usage.free_left, lim = j.usage.limit;
+      var txt = "Free queries left: " + left + " of " + lim;
+      quotaBox.textContent = txt;
+      quotaBox.className = (left <= 1 ? "warn" : "");
+    }
+
+    function setSources(arr){
+  if (!Array.isArray(arr) || !arr.length) {
+    srcBox.textContent = "Sources: not found in MiCA (may be outside the document scope).";
+    return;
+  }
+  // Будуємо список <details> з цитатами
+  var html = arr.map(function(s, i){
+    var page = s.page != null ? s.page : "?";
+    var score = (typeof s.score === "number" ? s.score : "?");
+    var text = (s.text || "").replace(/\s+/g, " ").trim();
+    return (
+      '<details>' +
+        '<summary>MiCA p.' + page + '<span class="badge">score ' + score + '</span></summary>' +
+        '<div class="snippet">' + (text || "(no excerpt)") + '</div>' +
+      '</details>'
+    );
+  }).join("");
+  srcBox.innerHTML = html;
+}
+
+    function ask(){
+      var v = inp && inp.value ? String(inp.value).trim() : "";
+      if(!v){ out.textContent = "Enter your question."; srcBox.textContent=""; return; }
+      out.textContent = "⏳ Loading…";
+      srcBox.textContent = "";
 
       var xhr = new XMLHttpRequest();
-      // АБСОЛЮТНА адреса бекенду на 8000 (щоб не було плутанини з портами)
+
+      // --- BACKEND URL ---
+      // If you serve this page via http.server on 5500, keep absolute URL:
       xhr.open('GET', 'http://127.0.0.1:8000/chat_get?q=' + encodeURIComponent(v), true);
-      xhr.timeout = 15000;
-      xhr.ontimeout = function(){ out.textContent = 'Перевищено час очікування.'; };
-      xhr.onerror = function(){ out.textContent = 'Мережева помилка.'; };
+      // If you serve mini.html via FastAPI at the same origin (e.g., /dev), you can use:
+      // xhr.open('GET', '/chat_get?q=' + encodeURIComponent(v), true);
+
+
+xhr.timeout = 8000;
+      xhr.ontimeout = function(){ out.textContent = "Timeout exceeded. Please try again."; };
 
       xhr.onreadystatechange = function(){
-        if (xhr.readyState === 4) {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            var t = xhr.responseText, shown = false;
-            try {
-              var j = JSON.parse(t);
-              if (j && j.answer) { out.textContent = j.answer; shown = true; }
-              else if (j && j.error) { out.textContent = j.error; shown = true; }
-            } catch(e){}
-            if (!shown) out.textContent = t || '(порожньо)';
-          } else {
-            out.textContent = 'HTTP ' + xhr.status + ' ' + (xhr.statusText||'');
+        if (xhr.readyState !== 4) return;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          var body = xhr.responseText, shown = false, j = null;
+          try { j = JSON.parse(body); } catch(e){}
+          if (j) {
+            if (j.answer) { out.textContent = j.answer; shown = true; }
+            else if (j.error) { out.textContent = j.error; shown = true; }
+            setQuota(j);
+            setSources(j.sources);
           }
+          if (!shown) out.textContent = body || "(empty)";
+        } else {
+          out.textContent = "HTTP " + xhr.status + " " + (xhr.statusText||"");
         }
       };
+      xhr.onerror = function(){ out.textContent = "Network error."; };
       xhr.send(null);
-    };
+    }
+
+    btn.onclick = ask;
+    inp.addEventListener('keydown', function(e){ if(e.key === 'Enter') ask(); });
+    inp.focus();
   })();
   </script>
 </body>
