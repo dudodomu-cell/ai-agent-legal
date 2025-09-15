@@ -3,10 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 import os
 from dotenv import load_dotenv
+from typing import Optional
+from fastapi import Query
 
 # load .env once on startup
 
 load_dotenv()
+
+def env_list(name: str, default_list):
+    v = os.getenv(name)
+    if not v:
+        return list(default_list)
+    return [x.strip() for x in v.split(",") if x.strip()]
 
 def env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -29,11 +37,15 @@ def env_int(name: str, default: int) -> int:
 # читаємо змінні з .env
 APP_VERSION    = os.getenv("APP_VERSION", "0.1.1")
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")   # старий параметр
+DEFAULT_MODEL  = os.getenv("DEFAULT_MODEL", OPENAI_MODEL)   # новий дефолт
+ALLOWED_MODELS = env_list("ALLOWED_MODELS", ["gpt-4o-mini","gpt-4o","gpt-4.1-mini","gpt-4.1"])
 REQUIRE_CONTEXT = env_bool("REQUIRE_CONTEXT", True)
 TOP_K           = env_int("TOP_K", 5)
 MIN_SIM         = env_float("MIN_SIM", 0.22)
 FAST_DEV        = env_bool("FAST_DEV", True) 
-FREE_LIMIT      = env_int("FREE_LIMIT", 5)          # поріг схожості, щоб вважати збіг реальним
+FREE_LIMIT      = env_int("FREE_LIMIT", 5)
+          # поріг схожості, щоб вважати збіг реальним
 
 from datetime import datetime
 
@@ -44,85 +56,87 @@ STATS = {
 
 app = FastAPI()
 
-# CORS: дозволяємо фронту на 5500 звертатися до бекенду на 8000
+# CORS: дозволяємо локальні origin-и 5500 (статична сторінка) і 8000 (бекенд)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500", "http://localhost:5500", "*"],  # dev-режим
+    allow_origins=[
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],   # явний список
     allow_headers=["*"],
 )
 
-def gpt_answer(question: str) -> str:
-    """
-    Повертає відповідь GPT або підміняє echo, якщо:
-    - немає OPENAI_API_KEY
-    - сталася помилка/таймаут
-    """
-    question = (question or "").strip()
-    if not question:
-        return "Порожнє питання."
-
+def gpt_answer(question: str, model_override: str | None = None) -> str:
+    ...
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        # Fallback без ключа
         return f"Echo: {question}"
 
-    try:
-        # Новий SDK OpenAI (v1)
-        from openai import OpenAI
-        # Можеш поміняти модель однією змінною
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        # Таймаут на весь запит, щоб не висіло
-        client = OpenAI(api_key=api_key, timeout=10.0)
+    # вибір моделі з валідацією
+    chosen = (model_override or "").strip() if model_override else ""
+    if chosen and chosen in ALLOWED_MODELS:
+        model = chosen
+    else:
+        model = DEFAULT_MODEL
 
+
+    # (як і було)
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, timeout=12.0)
         resp = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": question}],
-            temperature=0.2,
+            messages=[{"role":"system","content":"You are a legal assistant AI. Answer strictly from the provided MiCA context if available."},
+                      {"role":"user","content":prompt if ('prompt' in locals()) else question}],
+            temperature=0.0
         )
-        if resp and resp.choices:
-            return resp.choices[0].message.content or "Відповідь порожня."
-        return "Відповідь порожня."
+        ans = resp.choices[0].message.content if resp and resp.choices else ""
+        return ans or "Empty answer."
     except Exception as e:
-        # Акуратний fallback, щоб UI не висів
         return f"Echo (OpenAI error: {type(e).name}): {question}"
 
-def gpt_answer(question: str) -> str:
+def gpt_answer(question: str, model_override: str | None = None) -> str:
     question = (question or "").strip()
     if not question:
-        return "Порожнє питання."
+        return "Empty question."
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return f"Echo: {question}"
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # ---- RAG: шукаємо контекст ----
+    # Модель: override з валідацією
+    chosen = (model_override or "").strip()
+    model = chosen if (chosen and chosen in ALLOWED_MODELS) else DEFAULT_MODEL
+
+    # ---- RAG ----
     ctx_items = rag_search(question, k=TOP_K) if (VEC is not None and CHUNKS is not None) else []
-    # відфільтруємо за порогом схожості
     ctx_items = [c for c in ctx_items if c[2] >= MIN_SIM]
 
-    # Якщо ТРЕБА контекст, але його немає — чесно відмовляємось
     if REQUIRE_CONTEXT and not ctx_items:
-        return "Не можу відповісти на це на основі наданих документів (MiCA). Спробуйте уточнити питання."
+        return "I cannot answer this from the provided documents (MiCA). Please refine the question."
 
-    # Формуємо підказку з контекстом (або без, якщо індексу ще немає)
-    system = "You are a legal assistant AI. Answer strictly based only on the provided legal documents (MiCA Regulation). If the information is not in the context, say that you cannot answer."
+    system = (
+        "You are a legal assistant AI. Answer strictly based only on the provided legal documents (MiCA Regulation). "
+        "If the information is not in the context, say you cannot answer."
+    )
     prompt = rag_prompt(question, ctx_items) if ctx_items else question
 
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key, timeout=12.0)
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        messages = [{"role": "system", "content": system},
-                    {"role": "user", "content": prompt}]
-        resp = client.chat.completions.create(model=model, messages=messages, temperature=0.0)
+        msgs = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ]
+        resp = client.chat.completions.create(model=model, messages=msgs, temperature=0.0)
         ans = resp.choices[0].message.content if resp and resp.choices else ""
-        return ans or "Відповідь порожня."
+        return ans or "Empty answer."
     except Exception as e:
         return f"Echo (OpenAI error: {type(e).name}): {question}"
-
 # ---- RAG: завантаження індексу ----
 from pathlib import Path
 import numpy as np, pickle, os
@@ -197,59 +211,51 @@ def root():
 @app.post("/chat")
 def chat(req: dict):
     question = (req.get("question") or "").strip()
+    model_req = (req.get("model") or "").strip()
     if not question:
         return JSONResponse({"error": "empty question"}, status_code=400)
 
     STATS["total_requests"] += 1
     free_left = max(0, FREE_LIMIT - STATS["total_requests"])
-
-    # check free limit
     if STATS["total_requests"] > FREE_LIMIT:
         return {
             "answer": "You have reached the free request limit. Please subscribe to continue.",
             "sources": [],
-            "usage": {
-                "total_requests": STATS["total_requests"],
-                "free_left": 0,
-                "limit": FREE_LIMIT
-            }
+            "usage": {"total_requests": STATS["total_requests"], "free_left": 0, "limit": FREE_LIMIT},
+            "model_used": None
         }
 
-    # 🔹 шукаємо контекст
     ctx_items = rag_search(question, k=TOP_K)
     ctx_items = [c for c in ctx_items if c[2] >= MIN_SIM]
 
-    # 🔹 формуємо уривки для фронта
+    # побудова sources (з цитатами)
     if ctx_items:
-        src = [
-            {
-                "page": p,
-                "score": round(s, 3),
-                "text": (t[:320] + ("…" if len(t) > 320 else ""))  # скорочений фрагмент
-            }
-            for (t, p, s) in ctx_items
-        ]
+        src = [{"page": p, "score": round(s,3), "text": (t[:320] + ("…" if len(t) > 320 else ""))} for (t,p,s) in ctx_items]
     else:
         src = []
 
-    # 🔹 GPT-відповідь
-    answer = gpt_answer(question)
+    # вибір моделі і відповідь
+    # (прокидаємо override у gpt_answer)
+    answer = gpt_answer(question, model_override=model_req)
+
+    # визначимо фактично використану модель (валідуємо)
+    used = model_req if (model_req and model_req in ALLOWED_MODELS) else DEFAULT_MODEL
 
     return {
         "answer": answer,
         "sources": src,
-        "usage": {
-            "total_requests": STATS["total_requests"],
-            "free_left": free_left,
-            "limit": FREE_LIMIT
-        }
+        "usage": {"total_requests": STATS["total_requests"], "free_left": free_left, "limit": FREE_LIMIT},
+        "model_used": used
     }
         
 
 @app.get("/chat_get")
-def chat_get(q: str = Query(..., description="question")):
-    # Використовуємо той самий код, що й /chat, але з GET
-    return chat({"question": q})
+def chat_get(
+    q: str = Query(..., description="question"),
+    model: Optional[str] = Query(None, description="model name")
+):
+    # делегуємо до /chat-логіки, але в GET-форматі
+    return chat({"question": q, "model": model or ""})
 
 from fastapi.responses import JSONResponse
 
@@ -270,17 +276,6 @@ def version():
 
 from fastapi.responses import JSONResponse
 
-@app.get("/config")
-def config():
-    return {
-        "version": APP_VERSION,
-        "require_context": REQUIRE_CONTEXT,
-        "top_k": TOP_K,
-        "min_sim": MIN_SIM,
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "has_index": bool(VEC is not None and CHUNKS is not None),
-        # ВАЖЛИВО: ключ не показуємо!
-    }
 
 @app.get("/stats")
 def stats():
@@ -293,7 +288,14 @@ def config():
         "require_context": REQUIRE_CONTEXT,
         "top_k": TOP_K,
         "min_sim": MIN_SIM,
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "fast_dev": FAST_DEV,                # ⬅️ додай це
+        "model_default": DEFAULT_MODEL,
+        "models_allowed": ALLOWED_MODELS,
         "has_index": bool(VEC is not None and CHUNKS is not None),
+    }
+
+@app.get("/models")
+def models():
+    return {
+        "default": DEFAULT_MODEL,
+        "allowed": ALLOWED_MODELS
     }
